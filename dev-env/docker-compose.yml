@@ -16,7 +16,7 @@ services:
   influxdb:
     image: influxdb:2.7
     ports:
-      - "8087:8086"   # host 8087 -> container 8086 (8086 taken by a pre-existing influxdb)
+      - "${INFLUX_HOST_PORT:-8086}:8086"   # override INFLUX_HOST_PORT if 8086 is taken
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_ADMIN_USER}
