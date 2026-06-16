@@ -1,0 +1,177 @@
+name: ran-malleswaram
+
+x-influx-env: &influx-env
+  INFLUX_URL: http://influxdb:8086
+  INFLUX_TOKEN: ${INFLUXDB_TOKEN}
+  INFLUX_ORG: ${INFLUXDB_ORG}
+  INFLUX_BUCKET: ${INFLUXDB_BUCKET}
+
+x-sim-env: &sim-env
+  INTERVAL_SEC: "10"
+  TOPO_POLL_SEC: "5"
+  TOPOLOGY_FILE: /config/topology.json
+
+services:
+  # ---------------------------------------------------------------- data store
+  influxdb:
+    image: influxdb:2.7
+    ports:
+      - "8087:8086"   # host 8087 -> container 8086 (8086 taken by a pre-existing influxdb)
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_ADMIN_USER}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_ADMIN_PASSWORD}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  # ----------------------------------------------------------------- simulators
+  core-sim:
+    build: ./simulators/core
+    environment:
+      <<: [*influx-env, *sim-env]
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  cu-mls:
+    build: ./simulators/cu
+    environment:
+      <<: [*influx-env, *sim-env]
+      CU_ID: CU-MLS
+    volumes:
+      - ./config:/config:ro
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  du-mls-1:
+    build: ./simulators/du
+    environment:
+      <<: [*influx-env, *sim-env]
+      DU_ID: DU-MLS-1
+    volumes:
+      - ./config:/config:ro
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  du-mls-2:
+    build: ./simulators/du
+    environment:
+      <<: [*influx-env, *sim-env]
+      DU_ID: DU-MLS-2
+    volumes:
+      - ./config:/config:ro
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  du-mls-3:
+    build: ./simulators/du
+    environment:
+      <<: [*influx-env, *sim-env]
+      DU_ID: DU-MLS-3
+    volumes:
+      - ./config:/config:ro
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------- agents
+  controller:
+    build: ../agents/controller
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *influx-env
+      TOPOLOGY_FILE: /config/topology.json
+    volumes:
+      - ./config:/config
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  planning-api:
+    build: ../agents/planning
+    ports:
+      - "8081:8081"
+    environment:
+      CONTROLLER_URL: http://controller:8080
+    depends_on:
+      - controller
+
+  kpi-agent:
+    build: ../agents/kpi_agent
+    environment:
+      <<: *influx-env
+      CONTROLLER_URL: http://controller:8080
+      POLL_INTERVAL_SEC: "30"
+      OVERLOAD_PRB_PCT: "85"
+      UNDERLOAD_PRB_PCT: "20"
+      SINR_MIN_DB: "5"
+      POWER_WASTE_W: "500"
+      POWER_WASTE_MIN_UES: "15"
+      MIN_CONFIDENCE: "0.70"
+      MODEL_PATH: /app/kpi_model.pt
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
+  orchestrator:
+    build: ../agents/orchestrator
+    ports:
+      - "8082:8082"
+    environment:
+      <<: *influx-env
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      # Set CLAUDE_CLI_PATH to switch to the Claude-CLI backend (needs ~/.claude auth):
+      # CLAUDE_CLI_PATH: /usr/bin/claude
+      ANTHROPIC_MODEL_NAME: ${ANTHROPIC_MODEL_NAME:-sonnet}
+      CONTROLLER_URL: http://controller:8080
+      PLANNING_URL: http://planning-api:8081
+    volumes:
+      - ${CLAUDE_HOME:-${USERPROFILE}/.claude}:/root/.claude
+    depends_on:
+      - controller
+      - planning-api
+
+  map-server:
+    build: ../agents/map_server
+    ports:
+      - "8083:8083"
+    environment:
+      CONTROLLER_URL: http://controller:8080
+      ORCHESTRATOR_URL: http://orchestrator:8082
+    depends_on:
+      - controller
+      - orchestrator
+
+volumes:
+  influxdb_data:
+  influxdb_config:
+  grafana_data:
