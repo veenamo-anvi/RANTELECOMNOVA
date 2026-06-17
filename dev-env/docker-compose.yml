@@ -149,7 +149,11 @@ services:
       <<: *influx-env
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY}
-      # Set CLAUDE_CLI_PATH to switch to the Claude-CLI backend (needs ~/.claude auth):
+      # If ANTHROPIC_API_KEY is set, the orchestrator uses the Anthropic API backend
+      # (official SDK, real tool-calling) instead of Gemini:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-4-8}
+      # Set CLAUDE_CLI_PATH to use the Claude-CLI backend instead (needs ~/.claude auth):
       # CLAUDE_CLI_PATH: /usr/bin/claude
       ANTHROPIC_MODEL_NAME: ${ANTHROPIC_MODEL_NAME:-sonnet}
       CONTROLLER_URL: http://controller:8080

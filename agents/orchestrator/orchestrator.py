@@ -1,7 +1,10 @@
 """Orchestrator (spec §6.1 + F.3 + Appendix G) — FastAPI :8082.
 
-Two interchangeable LLM backends selected by CLAUDE_CLI_PATH: Gemini (default,
-google-genai) and Claude CLI. Drives a streaming multi-step tool-calling loop.
+Three interchangeable LLM backends, selected at startup (first match wins):
+  1. Anthropic API  — when ANTHROPIC_API_KEY is set (official SDK, real tool-calling)
+  2. Claude CLI     — when CLAUDE_CLI_PATH is set (text-only)
+  3. Gemini         — default (google-genai)
+All drive a streaming multi-step tool-calling loop.
 """
 import json
 import os
@@ -19,9 +22,19 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH", "")
 ANTHROPIC_MODEL_NAME = os.getenv("ANTHROPIC_MODEL_NAME", "sonnet")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Anthropic API backend model (a real model ID). Defaults to the latest Opus.
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
+ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "8192"))
 
-USE_CLAUDE = bool(CLAUDE_CLI_PATH)
-ACTIVE_MODEL = (f"claude/{ANTHROPIC_MODEL_NAME}" if USE_CLAUDE else GEMINI_MODEL)
+USE_ANTHROPIC_API = bool(ANTHROPIC_API_KEY)
+USE_CLAUDE = bool(CLAUDE_CLI_PATH) and not USE_ANTHROPIC_API
+if USE_ANTHROPIC_API:
+    ACTIVE_MODEL = ANTHROPIC_MODEL
+elif USE_CLAUDE:
+    ACTIVE_MODEL = f"claude/{ANTHROPIC_MODEL_NAME}"
+else:
+    ACTIVE_MODEL = GEMINI_MODEL
 
 SYSTEM_PROMPT = """You are the operations orchestrator for an O-RAN 4G/5G NSA network \
 in Malleswaram, North Bangalore: 30 cells across 10 macro sites (3 sectors each), \
@@ -40,8 +53,9 @@ Operating guidelines:
 
 app = FastAPI(title="RAN Orchestrator")
 
-_gemini_sessions = {}   # session_id -> list[types.Content]
-_claude_sessions = {}   # session_id -> list[{role, content}]
+_gemini_sessions = {}      # session_id -> list[types.Content]
+_claude_sessions = {}      # session_id -> list[{role, content}]
+_anthropic_sessions = {}   # session_id -> list[Anthropic message dicts]
 
 
 # --------------------------------------------------------------------------
@@ -154,8 +168,68 @@ def chat_turn_claude(message, session_id):
     yield out
 
 
+# --------------------------------------------------------------------------
+# Anthropic API backend (official SDK, real tool-calling loop)
+# --------------------------------------------------------------------------
+def _anthropic_client():
+    import anthropic
+    return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def chat_turn_anthropic(message, session_id):
+    import anthropic
+
+    client = _anthropic_client()
+    history = _anthropic_sessions.setdefault(session_id, [])
+    system = SYSTEM_PROMPT + build_network_context()
+    history.append({"role": "user", "content": message})
+
+    while True:
+        try:
+            with client.messages.stream(
+                model=ANTHROPIC_MODEL,
+                max_tokens=ANTHROPIC_MAX_TOKENS,
+                system=system,
+                tools=T.TOOL_SCHEMAS,
+                messages=history,
+            ) as stream:
+                for text in stream.text_stream:
+                    yield text
+                final = stream.get_final_message()
+        except anthropic.APIStatusError as e:
+            yield f"\n\n[Error] {e.status_code}: {getattr(e, 'message', str(e))}"
+            return
+        except Exception as e:  # noqa: BLE001
+            yield f"\n\n[Error] {e}"
+            return
+
+        # record the assistant turn verbatim (preserves tool_use blocks)
+        history.append({"role": "assistant", "content": final.content})
+
+        if final.stop_reason != "tool_use":
+            return
+
+        tool_results = []
+        for block in final.content:
+            if block.type != "tool_use":
+                continue
+            yield f"\n*[calling tool: {block.name}...]*\n"
+            try:
+                result = T.TOOL_MAP[block.name](dict(block.input))
+            except Exception as e:  # noqa: BLE001
+                result = {"error": str(e)}
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": json.dumps(_sanitise(result)),
+            })
+        history.append({"role": "user", "content": tool_results})
+
+
 def chat_turn(message, session_id):
-    if USE_CLAUDE:
+    if USE_ANTHROPIC_API:
+        yield from chat_turn_anthropic(message, session_id)
+    elif USE_CLAUDE:
         yield from chat_turn_claude(message, session_id)
     else:
         yield from chat_turn_gemini(message, session_id)
@@ -185,8 +259,31 @@ def chat(req: ChatRequest):
                              media_type="text/plain")
 
 
+def _anthropic_history(session_id):
+    out = []
+    for msg in _anthropic_sessions.get(session_id, []):
+        content = msg["content"]
+        if isinstance(content, str):
+            out.append({"role": msg["role"], "content": content})
+            continue
+        bits = []
+        for block in content:
+            btype = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+            if btype == "text":
+                bits.append(block["text"] if isinstance(block, dict) else block.text)
+            elif btype == "tool_use":
+                name = block["name"] if isinstance(block, dict) else block.name
+                bits.append(f"[Calling {name}]")
+            elif btype == "tool_result":
+                bits.append("[Tool result]")
+        out.append({"role": msg["role"], "content": " ".join(bits)})
+    return out
+
+
 @app.get("/history")
 def get_history(session_id: str = "default"):
+    if USE_ANTHROPIC_API:
+        return _anthropic_history(session_id)
     if USE_CLAUDE:
         return _claude_sessions.get(session_id, [])
     out = []
@@ -208,6 +305,7 @@ def get_history(session_id: str = "default"):
 def clear_history(session_id: str = "default"):
     _gemini_sessions.pop(session_id, None)
     _claude_sessions.pop(session_id, None)
+    _anthropic_sessions.pop(session_id, None)
     return {"status": "cleared", "session_id": session_id}
 
 
